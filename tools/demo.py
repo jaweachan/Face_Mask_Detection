@@ -6,6 +6,10 @@
 import sys
 sys.path.append(r'C:\Users\25758\PycharmProjects\YOLOX')
 
+import numpy as np
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
 import argparse
 import os
 import time
@@ -98,7 +102,6 @@ def make_parser():
     )
     return parser
 
-
 def get_image_list(path):
     image_names = []
     for maindir, subdir, file_name_list in os.walk(path):
@@ -108,6 +111,36 @@ def get_image_list(path):
             if ext in IMAGE_EXT:
                 image_names.append(apath)
     return image_names
+
+def load_engine(engine_path):
+    # TRT_LOGGER = trt.Logger(trt.Logger.WARNING)  # INFO
+    TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
+    with open(engine_path, 'rb') as f, trt.Runtime(TRT_LOGGER) as runtime:
+        return runtime.deserialize_cuda_engine(f.read())
+
+class TRT():
+    def __init__(self,engine):
+        self.context = engine.create_execution_context()
+        self.outshape = self.context.get_binding_shape(1)
+
+    def inference(self,image):
+        image=image.cpu().detach().numpy()
+        image = image.ravel()  # 数据平铺
+        output = np.empty((self.outshape), dtype=np.float32)
+        d_input = cuda.mem_alloc(1 * image.size * image.dtype.itemsize)
+        d_output = cuda.mem_alloc(1 * output.size * output.dtype.itemsize)
+        bindings = [int(d_input), int(d_output)]
+        # stream = cuda.Stream()
+
+        cuda.memcpy_htod(d_input, image)
+        self.context.execute_v2(bindings)
+        cuda.memcpy_dtoh(output, d_output)
+        output = torch.tensor(output.reshape(self.outshape))
+        print("%"*30)
+        print(output.shape)
+        print("%"*30)
+        # output = torch.nn.Softmax(dim=1)(torch.tensor(output))
+        return output
 
 class Predictor(object):
     def __init__(
@@ -131,15 +164,13 @@ class Predictor(object):
         self.device = device
         self.fp16 = fp16
         self.preproc = ValTransform(legacy=legacy)
+        self.trt_file=trt_file
         if trt_file is not None:
-            from torch2trt import TRTModule
-
-            model_trt = TRTModule()
-            model_trt.load_state_dict(torch.load(trt_file))
-
-            x = torch.ones(1, 3, exp.test_size[0], exp.test_size[1]).cuda()
-            self.model(x)
-            self.model = model_trt
+            # x = torch.ones(1, 3, exp.test_size[0], exp.test_size[1]).cuda()
+            # self.model(x)
+            engine = load_engine(trt_file)
+            model_trt=TRT(engine)
+            self.model=model_trt
 
     def inference(self, img):
         # 推理一张图像
@@ -164,7 +195,6 @@ class Predictor(object):
         img, _ = self.preproc(img, None, self.test_size)
         # 降维
         img = torch.from_numpy(img).unsqueeze(0)
-        img = img.float()
         if self.device == "gpu":
             img = img.cuda()
             if self.fp16:
@@ -172,9 +202,12 @@ class Predictor(object):
 
         with torch.no_grad():
             t0 = time.time()
-            outputs = self.model(img)
-            if self.decoder is not None:
-                outputs = self.decoder(outputs, dtype=outputs.type())
+            if self.trt_file is not None:
+                outputs = self.model.inference(img)
+            else:
+                outputs = self.model(img)
+            # if self.decoder is not None:
+                # outputs = self.decoder(outputs, dtype=outputs.type())
             # 将每一张图像的所有box信息输入，利用conf_thre,nms等过滤一部分box。
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre,
@@ -212,6 +245,9 @@ def image_demo(predictor, vis_folder, path, current_time, save_result):
     for image_name in files:
         # 推理
         outputs, img_info = predictor.inference(image_name)
+        print("&"*30)
+        print(outputs)
+        print("&"*30)
         # 可视化
         result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
         if save_result:
@@ -319,7 +355,11 @@ def main(exp, args):
     if args.trt:
         assert not args.fuse, "TensorRT model is not support model fusing!"
         # trt路径
-        trt_file = os.path.join(file_name, "model_trt.pth")
+        if args.ckpt is None:
+            trt_file = os.path.join(file_name, "model_trt.pth")
+        else:
+            trt_file = args.ckpt
+        print(trt_file)
         assert os.path.exists(
             trt_file
         ), "TensorRT model is not found!\n Run python3 tools/trt.py first!"
